@@ -1,4 +1,4 @@
-package main
+package agg_batch
 
 import (
 	"container/list"
@@ -9,10 +9,11 @@ import (
 	"time"
 )
 
-type MGetFn func(ctx context.Context, items []string) (map[string]interface{}, error)
-type RoomInfo struct {
-	Content string
-}
+
+
+
+type BatchGetFn func(ctx context.Context, items []string) (map[string]interface{}, error)
+
 type Task struct {
 	TaskId  string           //任务id
 	ItemKey string           //item key
@@ -20,27 +21,42 @@ type Task struct {
 	ErrCh   chan error       //错误channel
 }
 
-type Config struct {
-	ShardingNum int //分片数
-	DisChSize   int //分发器channel大小
-	//BatchGetFn 批量获取信息
-	MGetFn func(ctx context.Context, items []string) (map[string]interface{}, error)
-	//定时检查时间
-	CheckInterval time.Duration
-	MinBatchSize  int //最小批量大小
-	MaxBatchSize  int //最大批量大小
+type Options struct {
+	ShardingNum           int           //分片数
+	DisChSize             int           //分发器channel大小
+	CheckInterval         time.Duration //检查间隔
+	MinBatchSize          int           //最小批量大小
+	MaxBatchSize          int           //最大批量大小
+	IgnoreItemResNotExist bool          //忽略item查询结果不存在
+
+	BatchGetFn BatchGetFn //BatchGetFn 批量获取信息
+	ErrLogFn   func(format string, v ...interface{})
+	DebugLogFn func(format string, v ...interface{})
 }
 
 type Ctx struct {
 	context.Context
-
-	cfg Config
+	Opts Options
 }
 
-func NewCtx(ctx context.Context, cfg Config) *Ctx {
+func NewDefaultOpts(fn BatchGetFn) Options {
+	return Options{
+		ShardingNum:           10,
+		DisChSize:             500,
+		CheckInterval:         5 * time.Millisecond,
+		MinBatchSize:          20,
+		MaxBatchSize:          30,
+		BatchGetFn:            fn,
+		IgnoreItemResNotExist: true,
+		ErrLogFn:              log.Printf,
+		DebugLogFn:            log.Printf,
+	}
+}
+
+func NewCtx(ctx context.Context, opts Options) *Ctx {
 	return &Ctx{
 		Context: ctx,
-		cfg:     cfg,
+		Opts:    opts,
 	}
 }
 
@@ -51,30 +67,28 @@ type DispatcherManager struct {
 }
 
 func NewDispatcherManager(ctx *Ctx) *DispatcherManager {
-	if ctx.cfg.ShardingNum <= 0 {
+	if ctx.Opts.ShardingNum <= 0 {
 		panic("shardingNum must > 0")
 	}
-	if ctx.cfg.CheckInterval <= 0 {
-		panic("checkInterval must > 0")
-	}
-	if ctx.cfg.MinBatchSize <= 0 {
+	if ctx.Opts.MinBatchSize <= 0 {
 		panic("minBatchSize must > 0")
 	}
-	if ctx.cfg.MaxBatchSize < ctx.cfg.MinBatchSize {
+	if ctx.Opts.MaxBatchSize < ctx.Opts.MinBatchSize {
 		panic("maxBatchSize must >= minBatchSize")
 	}
+	if ctx.Opts.ErrLogFn == nil {
+		ctx.Opts.ErrLogFn = log.Printf
+	}
+	if ctx.Opts.DebugLogFn == nil {
+		ctx.Opts.DebugLogFn = log.Printf
+	}
 
-	ds := make([]*Dispatcher, ctx.cfg.ShardingNum, ctx.cfg.ShardingNum)
-	for i := 0; i < ctx.cfg.ShardingNum; i++ {
-		ds[i] = NewDispatcher(
-			i, ctx.cfg.MinBatchSize,
-			ctx.cfg.MaxBatchSize, ctx.cfg.CheckInterval,
-			log.Printf,
-			log.Printf,
-			ctx.cfg.DisChSize, ctx.cfg.MGetFn)
+	ds := make([]*Dispatcher, ctx.Opts.ShardingNum, ctx.Opts.ShardingNum)
+	for i := 0; i < ctx.Opts.ShardingNum; i++ {
+		ds[i] = NewDispatcher(i, ctx)
 	}
 	return &DispatcherManager{
-		shardingNum: ctx.cfg.ShardingNum,
+		shardingNum: ctx.Opts.ShardingNum,
 		ds:          ds,
 	}
 }
@@ -83,47 +97,29 @@ func (dm *DispatcherManager) hash() int {
 	return rand.Intn(100) % dm.shardingNum
 }
 
-func (dm *DispatcherManager) Submit(tasks []Task) {
-	dm.ds[dm.hash()].Submit(tasks)
+func (dm *DispatcherManager) Submit(tasks []Task) error {
+	return dm.ds[dm.hash()].Submit(tasks)
 }
 
+type TaskChunk struct {
+	SubmitTime time.Time //提交时间
+	Tasks      []Task
+}
 type Dispatcher struct {
-	Id            int           //id
-	MinBatchSize  int           //最小批量大小
-	MaxBatchSize  int           //最大批量大小
-	CheckInterval time.Duration //定时检查时间
-	MGetFn        MGetFn        //批量获取信息方法
-	TasksCh       chan []Task   //任务channel
-
-	ErrLogFn   func(string, ...interface{})
-	DebugLogFn func(string, ...interface{})
-
-	WaitingTasksQueue *list.List //等待中的任务队列 elem是[]Task
+	ctx context.Context
+	Id  int //id
+	Options
+	TaskChunkCh       chan TaskChunk //任务channel
+	WaitingTasksQueue *list.List     //等待中的任务队列 elem是[]Task
+	TaskNum           int            //任务数量
 }
 
-func NewDispatcher(
-	id int,
-	minBatchSize, maxBatchSize int,
-	checkInterval time.Duration,
-	errLogFn func(string, ...interface{}),
-	debugLogFn func(string, ...interface{}),
-	tasksChSize int, fn MGetFn) *Dispatcher {
-	if debugLogFn == nil {
-		debugLogFn = log.Printf
-	}
-	if errLogFn == nil {
-		errLogFn = log.Printf
-	}
+func NewDispatcher(id int, ctx *Ctx) *Dispatcher {
 	dis := &Dispatcher{
-		Id:            id,
-		MinBatchSize:  minBatchSize,
-		MaxBatchSize:  maxBatchSize,
-		CheckInterval: checkInterval,
-		MGetFn:        fn,
-		ErrLogFn:      errLogFn,
-		DebugLogFn:    debugLogFn,
-
-		TasksCh:           make(chan []Task, tasksChSize),
+		ctx:               ctx.Context,
+		Id:                id,
+		Options:           ctx.Opts,
+		TaskChunkCh:       make(chan TaskChunk, ctx.Opts.DisChSize),
 		WaitingTasksQueue: list.New(),
 	}
 
@@ -132,34 +128,40 @@ func NewDispatcher(
 	return dis
 }
 
-func (d *Dispatcher) Submit(tasks []Task) {
+func (d *Dispatcher) Submit(tasks []Task) error {
+	submitTime := time.Now()
 	taskLen := len(tasks)
 	if taskLen == 0 {
-		return
+		return nil
 	}
 	if taskLen > d.MaxBatchSize {
 		d.ErrLogFn("taskLen > maxBatchSize, taskLen=%d, maxBatchSize=%d", taskLen, d.MaxBatchSize)
+		return fmt.Errorf("taskLen > maxBatchSize, taskLen=%d, maxBatchSize=%d", taskLen, d.MaxBatchSize)
 	}
-	d.TasksCh <- tasks
+	d.TaskChunkCh <- TaskChunk{
+		SubmitTime: submitTime,
+		Tasks:      tasks,
+	}
+	return nil
 }
 
+//优化这里的效率
 func (d *Dispatcher) tryGetFetchTasks(mustGteMinBatchSize bool) (map[string][]Task, bool) {
 	queueLen := d.WaitingTasksQueue.Len()
 	if queueLen == 0 {
 		return nil, false
 	}
-	allElems := make([]*list.Element, 0, queueLen)
-	elem := d.WaitingTasksQueue.Front()
-	allElems = append(allElems, elem)
-	for elem = elem.Next(); elem != nil; elem = elem.Next() {
-		allElems = append(allElems, elem)
+	//如果taskNum都没有大于最小批量，其实也没必要往下遍历了
+	if mustGteMinBatchSize && d.TaskNum < d.MinBatchSize {
+		return nil, false
 	}
 	gteMinBatchSize := false //是否大于等于最小批量大小
 	needFetchElems := make([]*list.Element, 0, queueLen)
 	visitedKeys := make(map[string]struct{})
-	for _, el := range allElems {
-		tasks := el.Value.([]Task)
-		for _, t := range tasks {
+
+	for el := d.WaitingTasksQueue.Front(); el != nil; el = el.Next() {
+		taskChunk := el.Value.(TaskChunk)
+		for _, t := range taskChunk.Tasks {
 			visitedKeys[t.ItemKey] = struct{}{}
 		}
 		curNum := len(visitedKeys)
@@ -187,14 +189,15 @@ func (d *Dispatcher) tryGetFetchTasks(mustGteMinBatchSize bool) (map[string][]Ta
 	itemKey2Tasks := make(map[string][]Task)
 
 	for _, el := range needFetchElems {
-		tasks := el.Value.([]Task)
-		for _, t := range tasks {
+		taskChunk := el.Value.(TaskChunk)
+		for _, t := range taskChunk.Tasks {
 			if _, ok := itemKey2Tasks[t.ItemKey]; !ok {
 				itemKey2Tasks[t.ItemKey] = []Task{t}
 			} else {
 				itemKey2Tasks[t.ItemKey] = append(itemKey2Tasks[t.ItemKey], t)
 			}
 		}
+		d.TaskNum -= len(taskChunk.Tasks)
 		d.WaitingTasksQueue.Remove(el)
 	}
 
@@ -206,22 +209,24 @@ func (d *Dispatcher) run() {
 	ticker := time.NewTicker(d.CheckInterval)
 	for {
 		select {
-		case tasks := <-d.TasksCh:
-			d.WaitingTasksQueue.PushBack(tasks)
+		case taskChunk := <-d.TaskChunkCh:
+			d.WaitingTasksQueue.PushBack(taskChunk)
+			d.TaskNum += len(taskChunk.Tasks)
 			//判断下
 			key2Tasks, needFetch := d.tryGetFetchTasks(true)
 			if needFetch {
 				go d.fetch(context.Background(), key2Tasks)
-				fmt.Printf("id=%v,fetch tasks by tasksCh\n", d.Id)
-				ticker.Reset(d.CheckInterval) //reset
-			} else {
+				d.DebugLogFn("id=%v,fetch taskChunk by tasksCh\n", d.Id)
 			}
 		case <-ticker.C:
 			key2Tasks, needFetch := d.tryGetFetchTasks(false)
 			if needFetch {
 				go d.fetch(context.Background(), key2Tasks)
-				fmt.Printf("id=%v,fetch tasks by ticker\n", d.Id)
+				d.DebugLogFn("id=%v,fetch taskChunk by ticker\n", d.Id)
 			}
+
+		case <-d.ctx.Done():
+			return
 		}
 	}
 }
@@ -231,7 +236,7 @@ func (d *Dispatcher) fetch(ctx context.Context, roomId2Tasks map[string][]Task) 
 	for roomId := range roomId2Tasks {
 		roomIds = append(roomIds, roomId)
 	}
-	roomId2Info, err := d.MGetFn(ctx, roomIds)
+	roomId2Info, err := d.BatchGetFn(ctx, roomIds)
 	if err != nil {
 		for _, tasks := range roomId2Tasks {
 			for _, task := range tasks {
@@ -245,8 +250,14 @@ func (d *Dispatcher) fetch(ctx context.Context, roomId2Tasks map[string][]Task) 
 		info, ok := roomId2Info[roomId]
 		if !ok {
 			for _, task := range tasks {
-				task.ErrCh <- fmt.Errorf("disId=%v,not found roomid:%s", d.Id, roomId)
-				close(task.ErrCh)
+				if !d.IgnoreItemResNotExist {
+					task.ErrCh <- fmt.Errorf("disId=%v,not found roomid:%s", d.Id, roomId)
+					close(task.ErrCh)
+				} else {
+					task.ResCh <- nil
+					close(task.ResCh)
+				}
+
 			}
 			continue
 		}
@@ -271,13 +282,18 @@ func MGetWarp(disManager *DispatcherManager, keys []string) (map[string]interfac
 		}
 		taskList = append(taskList, task)
 	}
-	disManager.Submit(taskList)
+	err := disManager.Submit(taskList)
+	if err != nil {
+		return nil, err
+	}
 
 	key2Res := make(map[string]interface{})
 	for _, task := range taskList {
 		select {
 		case res := <-task.ResCh:
-			key2Res[task.ItemKey] = res
+			if res != nil {
+				key2Res[task.ItemKey] = res
+			}
 		case err := <-task.ErrCh:
 			return nil, err
 		}
