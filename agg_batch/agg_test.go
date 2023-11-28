@@ -1,7 +1,8 @@
-package agg_batch
+package aggbatch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -9,45 +10,42 @@ import (
 	"time"
 )
 
-type RoomInfo struct {
-	Content string
-}
-
-func testMGet(ctx context.Context, roomIds []string) (map[string]interface{}, error) {
-	roomId2Info := make(map[string]interface{})
-	for _, roomId := range roomIds {
-		var ct string
-		ct = fmt.Sprintf("task_%s", roomId)
-		roomId2Info[roomId] = RoomInfo{
-			Content: ct,
-		}
-	}
-	//模拟一下延迟
-	time.Sleep(time.Millisecond * 500)
-	return roomId2Info, nil
-}
+const FetchTimeoutMs = 200
+const RealFetchTimeoutMs = 100 * time.Millisecond
+const GoGenerateInterval = time.Microsecond * 100
+const AggRunTime = time.Second * 30000 //多少秒后cancel
 
 func TestAggReq(t *testing.T) {
-	maxBatchSize := 40
-	opts := NewDefaultOpts(testMGet)
-	ctx := NewCtx(context.Background(), opts)
-	disManager := NewDispatcherManager(ctx)
+	t.Logf("start TestAggReq")
+	ctx, cancel := context.WithCancel(context.Background())
+
+	aggCfg := NewDefaultAggCfg()
+	aggCfg.DisCfg.FetchTimeoutMs = FetchTimeoutMs
+	aggCtx := NewAggCtx(ctx, nil, aggCfg, testMGet, nil, nil)
+	aggCtx.AggCfg.ShardingNum = 1
+	disManager := NewAgg(aggCtx)
+
+	go func() {
+		time.Sleep(AggRunTime)
+		cancel()
+	}()
 
 	wg := sync.WaitGroup{}
-
 	for {
-		time.Sleep(1 * time.Millisecond)
+		time.Sleep(GoGenerateInterval)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			//生成0-maxBatchSize个roomId
-			roomNum := rand.Intn(maxBatchSize + 1)
+			roomNum := rand.Intn(aggCtx.AggCfg.MaxBatchSize + 1)
 			roomIds := getNRandomRoomId(roomNum)
-			id2Res, err := MGetWarp(disManager, roomIds)
-			if roomNum > opts.MaxBatchSize {
-				if err == nil {
-					panic("err must not be nil")
+			id2Res, err := MGetWarp(ctx, disManager, roomIds)
+			if err != nil {
+				if errors.Is(ErrDispatcherClosed, err) {
+					time.Sleep(time.Second)
+					panic(err)
 				}
+				t.Logf("BatchGet roomIds=%v,err: %v", roomIds, err)
 				return
 			}
 			for _, id := range roomIds {
@@ -55,22 +53,27 @@ func TestAggReq(t *testing.T) {
 					t.Errorf("BatchGet id=%v,res: %#v", id, res)
 				} else {
 					roomInfo := res.(RoomInfo)
-					expectedRes := fmt.Sprintf("task_%s", id)
-					if roomInfo.Content != expectedRes {
+					realRoomInfo := GetRes(id.(string))
+					if roomInfo.Content != realRoomInfo.Content {
 						panic(fmt.Sprintf("BatchGet roomIds=%v,res: %#v", roomIds, res))
 					}
+					t.Logf("BatchGet roomId=%v,res: %#v", id, roomInfo)
 				}
 			}
 			t.Logf("succ BatchGet roomIds len=%v,res: %v", len(roomIds), id2Res)
 		}()
 	}
 
-	wg.Wait()
-	fmt.Printf("main exit\n")
 }
 
-func getNRandomRoomId(n int) []string {
-	roomIds := make([]string, 0)
+func GetRes(roomId string) RoomInfo {
+	return RoomInfo{
+		Content: fmt.Sprintf("task_%s", roomId),
+	}
+}
+
+func getNRandomRoomId(n int) []interface{} {
+	roomIds := make([]interface{}, 0)
 	for i := 0; i < n; i++ {
 		roomId := rand.Intn(10000)
 		roomIds = append(roomIds, fmt.Sprintf("room_%d", roomId))
@@ -78,17 +81,22 @@ func getNRandomRoomId(n int) []string {
 	return roomIds
 }
 
-func TestTickerStop(t *testing.T) {
-	ticker := time.NewTicker(time.Second * 2)
-	after := time.After(time.Second * 5)
+type RoomInfo struct {
+	Content string
+}
+
+func testMGet(ctx context.Context, meteData map[string]interface{}, roomIds []interface{}) (map[interface{}]interface{}, error) {
+	roomId2Info := make(map[interface{}]interface{})
+	for _, roomId := range roomIds {
+		roomId2Info[roomId] = GetRes(roomId.(string))
+	}
+	//模拟一下延迟
 	for {
 		select {
-		case <-ticker.C:
-			t.Logf("ticker")
-		case <-after:
-			ticker.Stop()
-			t.Logf("stop ticker")
-			ticker = time.NewTicker(time.Second * 2)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(RealFetchTimeoutMs):
+			return roomId2Info, nil
 		}
 	}
 }
