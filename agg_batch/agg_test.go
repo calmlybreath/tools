@@ -10,23 +10,25 @@ import (
 	"time"
 )
 
-const FetchTimeoutMs = 200
-const RealFetchTimeoutMs = 100 * time.Millisecond
-const GoGenerateInterval = time.Microsecond * 100
-const AggRunTime = time.Second * 30000 //多少秒后cancel
+const FetchTimeoutMs = 100
+const RealFetchTimeoutMs = 50 * time.Millisecond
+const GoGenerateInterval = time.Microsecond * 1000
+const AggRunTime = time.Second * 3000 //多少秒后cancel
 
 func TestAggReq(t *testing.T) {
 	t.Logf("start TestAggReq")
 	ctx, cancel := context.WithCancel(context.Background())
 
-	aggCfg := NewDefaultAggCfg()
-	aggCfg.DisCfg.FetchTimeoutMs = FetchTimeoutMs
-	aggCtx := NewAggCtx(ctx, nil, aggCfg, testMGet, nil, nil)
-	aggCtx.AggCfg.ShardingNum = 1
-	disManager := NewAgg(aggCtx)
+	aggCfg := NewAggCfg()
+	aggCfg.MGetTimeoutMs = FetchTimeoutMs
+	aggCfg.MGetFn = testMGet
+	mngCfg := NewAggMngCfg("test")
+	mngCfg.AggNum = 1
+	disManager := NewAggManager(ctx, mngCfg, aggCfg)
 
 	go func() {
 		time.Sleep(AggRunTime)
+		t.Logf("cancel TestAggReq")
 		cancel()
 	}()
 
@@ -37,15 +39,14 @@ func TestAggReq(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			//生成0-maxBatchSize个roomId
-			roomNum := rand.Intn(aggCtx.AggCfg.MaxBatchSize + 1)
+			roomNum := rand.Intn(aggCfg.MaxBatchSize + 1)
 			roomIds := getNRandomRoomId(roomNum)
 			id2Res, err := MGetWarp(ctx, disManager, roomIds)
 			if err != nil {
-				if errors.Is(ErrDispatcherClosed, err) {
-					time.Sleep(time.Second)
+				if errors.Is(AggMngClosedError, err) {
 					panic(err)
 				}
-				t.Logf("BatchGet roomIds=%v,err: %v", roomIds, err)
+				t.Errorf("BatchGet roomIds=%v,err: %v", roomIds, err)
 				return
 			}
 			for _, id := range roomIds {
@@ -75,7 +76,7 @@ func GetRes(roomId string) RoomInfo {
 func getNRandomRoomId(n int) []interface{} {
 	roomIds := make([]interface{}, 0)
 	for i := 0; i < n; i++ {
-		roomId := rand.Intn(10000)
+		roomId := rand.Intn(10000000000)
 		roomIds = append(roomIds, fmt.Sprintf("room_%d", roomId))
 	}
 	return roomIds
