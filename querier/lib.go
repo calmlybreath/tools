@@ -118,21 +118,13 @@ func (q *QuerierStore) AddKeys(name string, keys []interface{}, ignoreErr bool) 
 	querier.AddKeys(keys, ignoreErr)
 }
 
-func (q *QuerierStore) callStepFunc(idx int) error {
-	if len(q.stepFuncs) == 0 {
-		panic("step funcs is empty")
-	}
-	if len(q.stepFuncs) <= idx {
-		return nil
-	}
-	stepFunc := q.stepFuncs[idx]
-	return stepFunc(q)
-}
-
 // 并发
 func (q *QuerierStore) Exec() error {
+	if len(q.stepFuncs) == 0 {
+		panic("stepFuncs is empty")
+	}
 	for idx := 0; idx < len(q.stepFuncs); idx++ {
-		err := q.callStepFunc(idx)
+		err := q.stepFuncs[idx](q)
 		if err != nil {
 			return err
 		}
